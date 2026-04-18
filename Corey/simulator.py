@@ -455,18 +455,21 @@ def _simulate_pit(
     if not pit.enter:
         return 0.0
 
-    refuel_time  = pit.fuel_refuel_amount_l / cfg.race.pit_refuel_rate_l_s if pit.fuel_refuel_amount_l > 0 else 0.0
+    # Actual refuel is capped by available tank space (submission engine caps it too)
+    actual_refuel = 0.0
+    if pit.fuel_refuel_amount_l > 0:
+        space_in_tank = car.fuel_tank_capacity_l - state.fuel_l
+        actual_refuel = min(pit.fuel_refuel_amount_l, max(0.0, space_in_tank))
+
+    refuel_time  = actual_refuel / cfg.race.pit_refuel_rate_l_s if actual_refuel > 0 else 0.0
     tyre_time    = cfg.race.pit_tyre_swap_time_s if pit.tyre_change_set_id is not None else 0.0
     base_time    = cfg.race.base_pit_stop_time_s
     pit_duration = refuel_time + tyre_time + base_time
 
-    # Refuel
-    if pit.fuel_refuel_amount_l > 0:
-        state.fuel_l = min(
-            car.fuel_tank_capacity_l,
-            state.fuel_l + pit.fuel_refuel_amount_l,
-        )
-        state.total_fuel_used += pit.fuel_refuel_amount_l
+    # Refuel — add actual amount to tank; do NOT add to total_fuel_used
+    # (that counter tracks only fuel consumed during driving, not pit refuels)
+    if actual_refuel > 0:
+        state.fuel_l = min(car.fuel_tank_capacity_l, state.fuel_l + actual_refuel)
 
     # Tyre change
     if pit.tyre_change_set_id is not None:
