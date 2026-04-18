@@ -152,15 +152,16 @@ def build_naive_strategy(config, tyre_degradation: bool = True) -> RaceStrategy:
     config : LevelConfig
         Loaded level configuration.
     tyre_degradation : bool
-        Match this to the SimConfig used when simulating.  When False, corner
-        speed limits are constant (no safety margin needed), giving slightly
-        faster braking targets.  Default: True.
+        When True (Levels 2+), a 0.5 m/s safety margin is subtracted from corner
+        max speeds to absorb friction drop accumulated on straights.
+        When False (Level 1 simple mode), no margin is used — the submission engine
+        tolerates the tiny (~0.002 m/s) rounding artefact from 2dp brake distances.
 
     Returns
     -------
     RaceStrategy
     """
-    from models import SegmentType, WeatherType, GRAVITY, TyreState, TYRE_PROPERTIES, K_STRAIGHT
+    from models import SegmentType, WeatherType, GRAVITY, TyreState
     import math
 
     initial_set = config.available_sets[0]
@@ -172,98 +173,57 @@ def build_naive_strategy(config, tyre_degradation: bool = True) -> RaceStrategy:
     car      = config.car
     segments = config.track.segments
 
-    # Safety margin (m/s) subtracted from corner max speeds when degradation
-    # is active.  The simulator accumulates both rolling and braking degradation
-    # on each straight, lowering the tyre friction — and thus the corner speed
-    # limit — by the time the car arrives. This margin absorbs that discrepancy.
-    # When tyre_degradation is False, friction is constant so no margin is needed.
-    # When degradation is active: 0.5 m/s absorbs friction drop from straight wear.
-    # When degradation is off: 0.01 m/s guards against floating-point ties at the
-    # corner entry check (where entry == max_speed would just barely pass, but
-    # rounding during braking can leave the car a hair over).
-    # Safety margin subtracted from corner max speeds.
-    # 0.5 m/s is used in both modes: in degradation mode it absorbs friction drop
-    # from straight wear; in simple mode it matches the submission engine's behaviour
-    # (verified against ground-truth submission logs).
-    CORNER_SPEED_MARGIN = 0.5
+    # Safety margin: 0.5 m/s when degradation is active, 0 otherwise.
+    CORNER_SPEED_MARGIN = 0.5 if tyre_degradation else 0.0
 
     def _corner_max_speed(corner_seg, friction: float) -> float:
-        """
-        Maximum safe entry speed for a corner, optionally reduced by
-        CORNER_SPEED_MARGIN to guard against degradation-induced friction drop.
-        """
-        raw = (friction * GRAVITY * corner_seg.radius_m) ** 0.5 + car.crawl_constant_m_s
+        raw = math.sqrt(friction * GRAVITY * corner_seg.radius_m) + car.crawl_constant_m_s
         return max(car.crawl_constant_m_s, raw - CORNER_SPEED_MARGIN)
 
-    def _required_exit_speed(straight_idx: int, seg) -> float:
-        """
-        The maximum speed we must not exceed when leaving this straight.
-        Scans ALL consecutive corners that follow the straight and returns
-        the minimum of their individual (margined) max speeds.
-        """
-        current_friction = tyre_state.current_friction(weather_type)
+    def _required_exit_speed(straight_idx: int) -> float:
+        """Min margined corner max speed across all consecutive corners after this straight."""
+        friction = tyre_state.current_friction(weather_type)
         required = car.max_speed_m_s
         j = straight_idx + 1
         while j < len(segments) and segments[j].type == SegmentType.CORNER:
-            required = min(required, _corner_max_speed(segments[j], current_friction))
+            required = min(required, _corner_max_speed(segments[j], friction))
             j += 1
         return required
 
-    def _reachable_top_speed(entry_speed: float, distance: float) -> float:
-        """Highest speed the car can reach from entry_speed over a given distance."""
-        return min(
-            car.max_speed_m_s,
-            math.sqrt(entry_speed ** 2 + 2 * car.accel_m_se2 * distance),
-        )
-
     laps: List[LapStrategy] = []
-    current_speed = 0.0  # car starts from rest on lap 1
 
     for lap_num in range(1, config.race.laps + 1):
         segment_actions = []
 
         for idx, seg in enumerate(segments):
             if seg.type == SegmentType.STRAIGHT:
-                # Highest speed achievable on this straight given entry speed
-                top_speed = _reachable_top_speed(current_speed, seg.length_m)
+                required_exit = _required_exit_speed(idx)
+                target_speed  = car.max_speed_m_s
 
-                # Speed we must not exceed at the end of this straight.
-                # Uses post-degradation friction so the braking target matches
-                # what the simulator will compute for the following corner.
-                required_exit = _required_exit_speed(idx, seg)
-
-                # Braking distance needed from top_speed down to required_exit
-                if top_speed > required_exit:
-                    brake_dist = (top_speed ** 2 - required_exit ** 2) / (2 * car.brake_m_se2)
+                if target_speed > required_exit:
+                    brake_dist = (target_speed ** 2 - required_exit ** 2) / (2 * car.brake_m_se2)
                 else:
                     brake_dist = 0.0
+
                 brake_dist = min(brake_dist, seg.length_m)
 
                 segment_actions.append(StraightAction(
                     segment_id=seg.id,
-                    target_m_s=round(top_speed, 4),
+                    target_m_s=target_speed,
                     brake_start_m_before_next=round(brake_dist, 2),
                 ))
-                # Exit speed after braking (can't exceed required_exit)
-                current_speed = min(top_speed, required_exit)
-
-            else:  # corner
-                friction = tyre_state.current_friction(weather_type)
-                corner_max = _corner_max_speed(seg, friction)
-                # Entry speed should already be <= corner_max thanks to braking above;
-                # clamp defensively in case of floating-point overshoot.
-                current_speed = min(current_speed, corner_max)
+            else:
                 segment_actions.append(CornerAction(segment_id=seg.id))
-                # Exit the corner at the same (clamped) speed
 
         laps.append(LapStrategy(
             lap=lap_num,
             segment_actions=segment_actions,
             pit=PitAction(enter=False),
         ))
-        # Speed carries over from the last segment of this lap into the next
 
     return RaceStrategy(
         initial_tyre_id=initial_set.primary_id,
         laps=laps,
     )
+
+

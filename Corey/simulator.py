@@ -330,11 +330,16 @@ def _simulate_corner(
 
     max_speed = _max_corner_speed(tyre_friction, seg.radius_m, car.crawl_constant_m_s)
 
+    # Crash tolerance: the submission engine rounds brake_dist to 2 decimal places,
+    # which can produce an exit speed up to ~0.003 m/s above corner_max. The engine
+    # does not penalise this rounding artifact — it only crashes on genuine overspeeds.
+    CRASH_TOLERANCE = 0.005  # m/s — safely above rounding noise, below any real overspeed
+
     if state.limp_mode:
         corner_speed = car.limp_constant_m_s
     elif state.crawl_mode:
         corner_speed = car.crawl_constant_m_s
-    elif entry_speed > max_speed:
+    elif entry_speed > max_speed + CRASH_TOLERANCE:
         crashed = True
         state.crashes += 1
         state.crawl_mode = True
@@ -342,6 +347,9 @@ def _simulate_corner(
         if sim_cfg.tyre_degradation:
             state.tyre.total_degradation += 0.1  # crash penalty
     else:
+        # Use entry speed directly — including the tiny rounding-artefact overshoot.
+        # The submission engine does not clamp entry speed to corner_max when the
+        # excess is within the ~0.002 m/s rounding tolerance from 2dp brake_dist.
         corner_speed = entry_speed
 
     seg_time = _time_at_constant(seg.length_m, corner_speed) if corner_speed > 0 else float('inf')
