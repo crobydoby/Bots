@@ -62,8 +62,7 @@ class Car:
     limp_constant_m_s: float    # Speed while in limp mode (m/s)
     crawl_constant_m_s: float   # Speed while in crawl mode (m/s)
     fuel_tank_capacity_l: float # Maximum fuel tank capacity (l)
-    initial_fuel_l: float 
-    fuel_soft_cap: float      # Fuel at race start (l)
+    initial_fuel_l: float       # Fuel at race start (l)
 
 
 # ---------------------------------------------------------------------------
