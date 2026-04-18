@@ -434,3 +434,255 @@ def build_lambda_strategy(config, lam: float) -> RaceStrategy:
         laps_out.append(LapStrategy(lap=lap_num, segment_actions=actions, pit=pit))
 
     return RaceStrategy(initial_tyre_id=soft_set.primary_id, laps=laps_out)
+
+"""
+Level 3 additions — drop these into their respective files.
+ 
+=============================================================
+  STRATEGY.PY — add build_level3_strategy() at the bottom
+=============================================================
+"""
+ 
+# ---------------------------------------------------------------------------
+# Level 3: weather-aware strategy with tyre-change sweep
+# ---------------------------------------------------------------------------
+ 
+def build_level3_strategy(config, lam: float, change_intervals: list) -> "RaceStrategy":
+    """
+    Build a weather + fuel aware strategy for Level 3.
+ 
+    Straight speed is scaled by lambda (same as Level 2).
+ 
+    Tyre-change rule:
+        change_intervals is a list of lap numbers at which a pit is *forced*
+        for a tyre change.  At each forced pit the best tyre for the
+        predominant weather over the *next* stint is selected automatically.
+        Fuel is topped up at every pit using the same greedy rule as Level 2.
+ 
+    Parameters
+    ----------
+    config : LevelConfig
+        Level 3 configuration (with weather conditions).
+    lam : float
+        Speed scaling factor in (0, 1].
+    change_intervals : list[int]
+        Lap numbers at which a tyre change pit is forced.
+        e.g. [20, 45] → pit on lap 20 and lap 45.
+ 
+    Returns
+    -------
+    RaceStrategy
+    """
+    from models import SegmentType, WeatherType, TyreState, GRAVITY
+    import math
+ 
+    car        = config.car
+    segments   = config.track.segments
+    total_laps = config.race.laps
+ 
+    # ---- Helper: weather at a given elapsed race time ----
+    weather_conditions = config.weather_conditions  # ordered list with .duration_s
+ 
+    def weather_cycle_duration() -> float:
+        return sum(w.duration_s for w in weather_conditions)
+ 
+    def weather_at(time_s: float):
+        """Return the WeatherCondition active at time_s."""
+        if not weather_conditions:
+            return None
+        cycle = weather_cycle_duration()
+        t = time_s % cycle
+        acc = 0.0
+        for w in weather_conditions:
+            acc += w.duration_s
+            if t < acc:
+                return w
+        return weather_conditions[-1]
+ 
+    def dominant_weather_in_window(start_s: float, end_s: float):
+        """Return the weather condition that covers the most time in [start_s, end_s]."""
+        if not weather_conditions:
+            return WeatherType.DRY
+        from collections import defaultdict
+        coverage = defaultdict(float)
+        step = 10.0
+        t = start_s
+        while t < end_s:
+            w = weather_at(t)
+            coverage[w.condition] += min(step, end_s - t)
+            t += step
+        return max(coverage, key=coverage.get)
+ 
+    # ---- Helper: pick best tyre compound for a weather condition ----
+    def best_tyre_for_weather(weather_type, available_sets):
+        """
+        Choose the tyre set that maximises corner speed (friction) for the
+        given weather condition.  Uses the first unused set of the best compound.
+        """
+        from models import WeatherType
+        weather_attr = {
+            WeatherType.DRY:        "dry_friction_multiplier",
+            WeatherType.COLD:       "cold_friction_multiplier",
+            WeatherType.LIGHT_RAIN: "light_rain_friction_multiplier",
+            WeatherType.HEAVY_RAIN: "heavy_rain_friction_multiplier",
+        }.get(weather_type, "dry_friction_multiplier")
+ 
+        tyre_props = config.tyre_properties   # dict compound → TyreProperties
+ 
+        # Score each available set by base_friction * weather_multiplier
+        best_set  = None
+        best_score = -1.0
+        for tset in available_sets:
+            props = tyre_props[tset.compound]
+            score = props.life_span * getattr(props, weather_attr, 1.0)
+            if score > best_score:
+                best_score = score
+                best_set   = tset
+        return best_set
+ 
+    # ---- Pre-compute per-straight actions (same as Level 2) ----
+    # Start with the initial tyre to determine corner exit speeds.
+    # For level 3 we use no degradation margin in pre-computation (dynamic).
+    initial_set = config.available_sets[0]
+    tyre_state  = TyreState(tyre_set=initial_set)
+    start_weather = config.weather_conditions[0] if config.weather_conditions else None
+    from models import WeatherType
+    weather_type = start_weather.condition if start_weather else WeatherType.DRY
+ 
+    _, _required_exit = _make_corner_helpers(car, segments, tyre_state, weather_type,
+                                             corner_speed_margin=0.0)
+ 
+    target_speed = lam * car.max_speed_m_s
+ 
+    prev_is_straight = set()
+    for i, seg in enumerate(segments):
+        if seg.type == SegmentType.STRAIGHT and i > 0:
+            if segments[i - 1].type == SegmentType.STRAIGHT:
+                prev_is_straight.add(seg.id)
+ 
+    straight_actions: dict = {}
+    for idx, seg in enumerate(segments):
+        if seg.type == SegmentType.STRAIGHT:
+            required_exit = _required_exit(idx)
+            cruise = max(target_speed, required_exit)
+            cruise = min(cruise, car.max_speed_m_s)
+            brake_from = car.max_speed_m_s if seg.id in prev_is_straight else cruise
+            if brake_from > required_exit:
+                brake_dist = (brake_from ** 2 - required_exit ** 2) / (2 * car.brake_m_se2)
+            else:
+                brake_dist = 0.0
+            brake_dist = min(brake_dist, seg.length_m)
+            straight_actions[seg.id] = StraightAction(
+                segment_id=seg.id,
+                target_m_s=round(cruise, 4),
+                brake_start_m_before_next=round(brake_dist, 2),
+            )
+ 
+    # ---- Probe run: get fuel per lap ----
+    from simulator import simulate, SimConfig
+ 
+    probe_laps = []
+    for ln in range(1, total_laps + 1):
+        actions = list(straight_actions.values()) + [
+            CornerAction(segment_id=seg.id)
+            for seg in segments if seg.type == SegmentType.CORNER
+        ]
+        actions.sort(key=lambda a: a.segment_id)
+        probe_laps.append(LapStrategy(lap=ln, segment_actions=actions, pit=PitAction(enter=False)))
+ 
+    soft_set = next(ts for ts in config.available_sets
+                    if ts.compound.value == "Soft")
+    probe_strategy = RaceStrategy(initial_tyre_id=soft_set.primary_id, laps=probe_laps)
+    probe_cfg = SimConfig(tyre_degradation=False, fuel_consumption=True)
+    probe_result = simulate(config, probe_strategy, probe_cfg)
+    fuel_per_lap = probe_result.lap_results[0].fuel_used_l
+ 
+    # ---- Estimate lap duration for weather-window calculations ----
+    # Use average lap time from probe run.
+    avg_lap_time_s = probe_result.total_time_s / total_laps
+ 
+    # ---- Build pit schedule ----
+    # Track both fuel and tyre-change pits.
+    # change_intervals specifies FORCED tyre-change laps (1-indexed, not final lap).
+    forced_change_laps = set(
+        l for l in change_intervals
+        if 1 <= l < total_laps
+    )
+ 
+    pit_schedule: dict = {}   # lap_num → {"fuel": float, "tyre_set": TyreSet|None}
+    current_fuel = car.initial_fuel_l
+    elapsed_time = 0.0
+ 
+    # Tyre rotation: start on best tyre for opening weather, rotate on forced laps.
+    used_set_ids = set()
+ 
+    def pick_tyre(lap_num_after_pit):
+        """Pick the best available (unused) tyre for weather starting at lap_num_after_pit."""
+        stint_start_s = elapsed_time
+        stint_end_s   = stint_start_s + avg_lap_time_s * 20  # look 20 laps ahead
+        dom_weather   = dominant_weather_in_window(stint_start_s, stint_end_s)
+        remaining_sets = [s for s in config.available_sets if s.primary_id not in used_set_ids]
+        if not remaining_sets:
+            # All used — just reuse compound with best score (fallback)
+            remaining_sets = config.available_sets
+        chosen = best_tyre_for_weather(dom_weather, remaining_sets)
+        return chosen
+ 
+    # Initial tyre
+    initial_tyre = pick_tyre(1)
+    used_set_ids.add(initial_tyre.primary_id)
+ 
+    for lap_num in range(1, total_laps + 1):
+        current_fuel -= fuel_per_lap
+        current_fuel  = max(current_fuel, 0.0)
+        elapsed_time += avg_lap_time_s
+ 
+        if lap_num == total_laps:
+            break
+ 
+        needs_tyre  = lap_num in forced_change_laps
+        needs_fuel  = current_fuel < fuel_per_lap
+ 
+        if needs_tyre or needs_fuel:
+            remaining_laps_after = total_laps - lap_num
+            if needs_fuel:
+                needed   = remaining_laps_after * fuel_per_lap
+                headroom = car.fuel_tank_capacity_l - current_fuel
+                refuel   = round(min(needed, headroom), 4)
+            else:
+                refuel = 0.0
+ 
+            if needs_tyre:
+                new_set = pick_tyre(lap_num + 1)
+                used_set_ids.add(new_set.primary_id)
+            else:
+                new_set = None
+ 
+            pit_schedule[lap_num] = {"fuel": refuel, "tyre_set": new_set}
+            if refuel > 0:
+                current_fuel += refuel
+ 
+    # ---- Assemble final RaceStrategy ----
+    laps_out: list = []
+    for lap_num in range(1, total_laps + 1):
+        actions = list(straight_actions.values()) + [
+            CornerAction(segment_id=seg.id)
+            for seg in segments if seg.type == SegmentType.CORNER
+        ]
+        actions.sort(key=lambda a: a.segment_id)
+ 
+        if lap_num in pit_schedule:
+            entry = pit_schedule[lap_num]
+            tyre_set = entry["tyre_set"]
+            pit = PitAction(
+                enter=True,
+                tyre_change_set_id=tyre_set.primary_id if tyre_set else None,
+                fuel_refuel_amount_l=entry["fuel"],
+            )
+        else:
+            pit = PitAction(enter=False)
+ 
+        laps_out.append(LapStrategy(lap=lap_num, segment_actions=actions, pit=pit))
+ 
+    return RaceStrategy(initial_tyre_id=initial_tyre.primary_id, laps=laps_out)
+ 
