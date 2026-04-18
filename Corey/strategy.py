@@ -151,44 +151,22 @@ def build_naive_strategy(config, tyre_degradation: bool = True) -> RaceStrategy:
     ----------
     config : LevelConfig
         Loaded level configuration.
-    tyre_degradation : bool
-        When True (Levels 2+), a 0.5 m/s safety margin is subtracted from corner
-        max speeds to absorb friction drop accumulated on straights.
-        When False (Level 1 simple mode), no margin is used — the submission engine
-        tolerates the tiny (~0.002 m/s) rounding artefact from 2dp brake distances.
 
     Returns
     -------
     RaceStrategy
     """
     from models import SegmentType, WeatherType, GRAVITY, TyreState
-    import math
 
     initial_set = config.available_sets[0]
     tyre_state  = TyreState(tyre_set=initial_set)
 
+    # Use the starting weather to estimate corner entry speed limits
     start_weather = config.weather_conditions[0] if config.weather_conditions else None
     weather_type  = start_weather.condition if start_weather else WeatherType.DRY
 
     car      = config.car
     segments = config.track.segments
-
-    # Safety margin: 0.5 m/s when degradation is active, 0 otherwise.
-    CORNER_SPEED_MARGIN = 0.5 if tyre_degradation else 0.0
-
-    def _corner_max_speed(corner_seg, friction: float) -> float:
-        raw = math.sqrt(friction * GRAVITY * corner_seg.radius_m) + car.crawl_constant_m_s
-        return max(car.crawl_constant_m_s, raw - CORNER_SPEED_MARGIN)
-
-    def _required_exit_speed(straight_idx: int) -> float:
-        """Min margined corner max speed across all consecutive corners after this straight."""
-        friction = tyre_state.current_friction(weather_type)
-        required = car.max_speed_m_s
-        j = straight_idx + 1
-        while j < len(segments) and segments[j].type == SegmentType.CORNER:
-            required = min(required, _corner_max_speed(segments[j], friction))
-            j += 1
-        return required
 
     laps: List[LapStrategy] = []
 
@@ -197,15 +175,47 @@ def build_naive_strategy(config, tyre_degradation: bool = True) -> RaceStrategy:
 
         for idx, seg in enumerate(segments):
             if seg.type == SegmentType.STRAIGHT:
-                required_exit = _required_exit_speed(idx)
-                target_speed  = car.max_speed_m_s
+                # Determine required entry speed for the next segment (if a corner)
+                next_seg = segments[idx + 1] if idx + 1 < len(segments) else None
 
-                if target_speed > required_exit:
-                    brake_dist = (target_speed ** 2 - required_exit ** 2) / (2 * car.brake_m_se2)
+                corners = []
+                if next_seg and next_seg.type == SegmentType.CORNER:
+                    check_idx = idx + 1
+                    while check_idx < len(segments):
+                        check_next = segments[check_idx]
+                        if check_next.type != SegmentType.CORNER:
+                            break
+                        corners.append(check_next)
+                        check_idx += 1
+
+                if corners:
+                    corner_radii = [c.radius_m for c in corners if c.radius_m is not None and c.radius_m > 0]
+                    if corner_radii:
+                        friction = tyre_state.current_friction(weather_type)
+                        min_corner_radius = min(corner_radii)
+                        max_corner = (
+                            (friction * GRAVITY * min_corner_radius) ** 0.5
+                            + car.crawl_constant_m_s
+                        )
+                        corner_entry_speed = min(max_corner, car.max_speed_m_s)
+
+                        # Distance required to brake from max_speed to the limiting corner speed
+                        target_speed = car.max_speed_m_s
+                        v_i = target_speed
+                        v_f = corner_entry_speed
+                        if v_i > v_f:
+                            # d = (v_i² - v_f²) / (2 * brake)
+                            brake_dist = (v_i ** 2 - v_f ** 2) / (2 * car.brake_m_se2)
+                        else:
+                            brake_dist = 0.0
+
+                        brake_dist = min(brake_dist, seg.length_m)
+                    else:
+                        target_speed = car.max_speed_m_s
+                        brake_dist = 0.0
                 else:
-                    brake_dist = 0.0
-
-                brake_dist = min(brake_dist, seg.length_m)
+                    target_speed = car.max_speed_m_s
+                    brake_dist   = 0.0
 
                 segment_actions.append(StraightAction(
                     segment_id=seg.id,
@@ -225,5 +235,3 @@ def build_naive_strategy(config, tyre_degradation: bool = True) -> RaceStrategy:
         initial_tyre_id=initial_set.primary_id,
         laps=laps,
     )
-
-
