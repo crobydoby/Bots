@@ -350,9 +350,11 @@ def _simulate_corner(
         # Use entry speed directly — including the tiny rounding-artefact overshoot.
         # The submission engine does not clamp entry speed to corner_max when the
         # excess is within the ~0.002 m/s rounding tolerance from 2dp brake_dist.
-        corner_speed = entry_speed
+        # Guard against zero-speed corner entry from over-conservative braking.
+        # A corner cannot be traversed at 0 m/s; use crawl speed as the floor.
+        corner_speed = entry_speed if entry_speed > 0 else car.crawl_constant_m_s
 
-    seg_time = _time_at_constant(seg.length_m, corner_speed) if corner_speed > 0 else float('inf')
+    seg_time = _time_at_constant(seg.length_m, corner_speed)
     fuel     = _fuel_used(corner_speed, corner_speed, seg.length_m) if sim_cfg.fuel_consumption else 0.0
     deg      = _tyre_degrade_corner(corner_speed, seg.radius_m, state.tyre, weather) if sim_cfg.tyre_degradation else 0.0
 

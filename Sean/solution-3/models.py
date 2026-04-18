@@ -141,6 +141,11 @@ class TyreProperties:
             WeatherType.HEAVY_RAIN: self.heavy_rain_degradation,
         }[weather]
 
+    @property
+    def base_friction_coefficient(self) -> float:
+        """Compatibility alias used by older strategy code."""
+        return self.life_span
+
 
 @dataclass
 class TyreSet:

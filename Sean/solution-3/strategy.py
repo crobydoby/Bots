@@ -720,32 +720,52 @@ def _dominant_weather(weather_conditions, start_s: float, end_s: float):
             coverage[w.condition] += min(step, end_s - t)
         t += step
     return max(coverage, key=coverage.get) if coverage else WeatherType.DRY
- 
- 
-def _worst_friction_weather(tyre_props, compound, weather_conditions):
-    """
-    Return the WeatherType that gives the LOWEST tyre friction for `compound`.
-    Used to size brake distances conservatively so they are safe under every
-    possible weather condition in the level.
-    """
+
+
+def _min_decel_multiplier(weather_conditions, start_s: float, end_s: float) -> float:
+    """Minimum deceleration multiplier observed in [start_s, end_s]."""
+    if not weather_conditions:
+        return 1.0
+    step = 30.0
+    t = start_s
+    min_mult = float("inf")
+    while t < end_s:
+        w = _weather_at(weather_conditions, t)
+        if w is not None:
+            min_mult = min(min_mult, w.deceleration_multiplier)
+        t += step
+    if min_mult == float("inf"):
+        return 1.0
+    return min_mult
+
+
+def _min_friction_multiplier(weather_conditions, start_s: float, end_s: float, props) -> float:
+    """Minimum tyre friction multiplier observed in [start_s, end_s] for a compound."""
+    if not weather_conditions:
+        return props.dry_friction_multiplier
+
     from models import WeatherType
+
     attr_map = {
-        WeatherType.DRY:        "dry_friction_multiplier",
-        WeatherType.COLD:       "cold_friction_multiplier",
+        WeatherType.DRY: "dry_friction_multiplier",
+        WeatherType.COLD: "cold_friction_multiplier",
         WeatherType.LIGHT_RAIN: "light_rain_friction_multiplier",
         WeatherType.HEAVY_RAIN: "heavy_rain_friction_multiplier",
     }
-    props = tyre_props[compound]
-    seen = {w.condition for w in weather_conditions} if weather_conditions else {WeatherType.DRY}
- 
-    worst_weather, worst_friction = WeatherType.DRY, float('inf')
-    for wt in seen:
-        attr = attr_map.get(wt, "dry_friction_multiplier")
-        friction = props.life_span * getattr(props, attr, 1.0)
-        if friction < worst_friction:
-            worst_friction = friction
-            worst_weather  = wt
-    return worst_weather
+
+    step = 30.0
+    t = start_s
+    min_mult = float("inf")
+    while t < end_s:
+        w = _weather_at(weather_conditions, t)
+        if w is not None:
+            attr = attr_map.get(w.condition, "dry_friction_multiplier")
+            min_mult = min(min_mult, getattr(props, attr, 1.0))
+        t += step
+
+    if min_mult == float("inf"):
+        return props.dry_friction_multiplier
+    return min_mult
  
  
 def _best_tyre_for_weather(weather_type, candidate_sets, tyre_props):
@@ -765,25 +785,64 @@ def _best_tyre_for_weather(weather_type, candidate_sets, tyre_props):
         if score > best_score:
             best_score, best_set = score, tset
     return best_set
+
+
+def _best_tyre_for_window(
+    weather_conditions,
+    start_s: float,
+    end_s: float,
+    candidate_sets,
+    tyre_props,
+):
+    """Pick the set with the highest worst-case friction over [start_s, end_s]."""
+    best_set, best_score = None, -1.0
+    for tset in candidate_sets:
+        props = tyre_props[tset.compound]
+        min_mult = _min_friction_multiplier(weather_conditions, start_s, end_s, props)
+        score = props.life_span * min_mult
+        if score > best_score:
+            best_score, best_set = score, tset
+    return best_set
  
  
-def _build_straight_actions_for_compound(config, lam: float, compound, worst_weather_type) -> Dict[int, "StraightAction"]:
+def _build_straight_actions_for_compound(
+    config,
+    lam: float,
+    compound,
+    friction_multiplier: float,
+    decel_multiplier: float,
+) -> Dict[int, "StraightAction"]:
     """
-    Build straight actions for a compound sized for its worst-case weather friction.
-    This guarantees brake distances are always sufficient regardless of actual weather.
+    Build straight actions for a compound under a specific lap profile.
+    Corner entry speed uses friction_multiplier and braking uses decel_multiplier.
     """
-    from models import SegmentType, TyreState
+    from models import SegmentType, GRAVITY
  
-    car      = config.car
-    segments = config.track.segments
+    car        = config.car
+    segments   = config.track.segments
+    tyre_props = config.tyre_properties
  
-    tyre_set   = next(ts for ts in config.available_sets if ts.compound == compound)
-    tyre_state = TyreState(tyre_set=tyre_set)
+    effective_brake_m_se2 = max(car.brake_m_se2 * decel_multiplier, 1e-9)
+    corner_speed_margin_m_s = 1.5
+    brake_distance_safety = 1.10
  
-    _, _required_exit = _make_corner_helpers(
-        car, segments, tyre_state, worst_weather_type,
-        corner_speed_margin=0.5,
-    )
+    props = tyre_props[compound]
+ 
+    def _corner_speed(corner_seg) -> float:
+        """Safe corner entry speed for this lap profile and tyre compound."""
+        friction = props.life_span * friction_multiplier
+        spd = math.sqrt(max(friction * GRAVITY * corner_seg.radius_m, 0.0)) \
+              + car.crawl_constant_m_s
+        return max(car.crawl_constant_m_s, spd - corner_speed_margin_m_s)
+ 
+    def _required_exit(straight_idx: int) -> float:
+        """Min corner speed across all consecutive corners after this straight."""
+        required = car.max_speed_m_s
+        j = straight_idx + 1
+        while j < len(segments) and segments[j].type == SegmentType.CORNER:
+            required = min(required, _corner_speed(segments[j]))
+            j += 1
+        return required
  
     target_speed = lam * car.max_speed_m_s
  
@@ -798,10 +857,14 @@ def _build_straight_actions_for_compound(config, lam: float, compound, worst_wea
     for idx, seg in enumerate(segments):
         if seg.type != SegmentType.STRAIGHT:
             continue
-        req_exit = _required_exit(idx)
-        cruise   = min(max(target_speed, req_exit), car.max_speed_m_s)
+        req_exit  = _required_exit(idx)
+        cruise    = min(max(target_speed, req_exit), car.max_speed_m_s)
+        # Conservative braking within this lap: assume max possible entry speed
+        # where carry-over can occur and apply this lap's deceleration multiplier.
         brake_frm = car.max_speed_m_s if seg.id in prev_is_straight else cruise
-        bd = (brake_frm ** 2 - req_exit ** 2) / (2 * car.brake_m_se2) if brake_frm > req_exit else 0.0
+        bd = (brake_frm ** 2 - req_exit ** 2) / (2 * effective_brake_m_se2) \
+             if brake_frm > req_exit else 0.0
+        bd *= brake_distance_safety
         bd = min(bd, seg.length_m)
         actions[seg.id] = StraightAction(
             segment_id=seg.id,
@@ -819,21 +882,16 @@ def build_level3_strategy(config, lam: float, change_intervals: list) -> RaceStr
     """
     Weather + fuel aware strategy for Level 3.
  
-    Brake distances are computed per compound using the WORST-CASE weather
-    multiplier for that compound across all conditions in the level file.
-    This eliminates crashes caused by weather-dependent friction changes.
+    Brake distances are sized for the worst-case corner speed across ALL
+    weather conditions, eliminating crashes from weather transitions.
  
     Parameters
     ----------
     config           : LevelConfig
     lam              : float       — speed scaling factor (0, 1]
     change_intervals : list[int]   — lap numbers for forced tyre changes
- 
-    Returns
-    -------
-    RaceStrategy
     """
-    from models import SegmentType, WeatherType, TyreState
+    from models import SegmentType, WeatherType
     from simulator import simulate, SimConfig
  
     car        = config.car
@@ -845,11 +903,25 @@ def build_level3_strategy(config, lam: float, change_intervals: list) -> RaceStr
     forced_change_laps = {l for l in change_intervals if 1 <= l < total_laps}
  
     # ------------------------------------------------------------------
-    # 1. Probe run to get fuel/lap and avg lap time
+    # 1. Probe run: fuel/lap and avg lap time
     # ------------------------------------------------------------------
     soft_set = next(ts for ts in config.available_sets if ts.compound.value == "Soft")
-    soft_worst = _worst_friction_weather(tyre_props, soft_set.compound, weather_conditions)
-    probe_actions = _build_straight_actions_for_compound(config, lam, soft_set.compound, soft_worst)
+    start_weather = _weather_at(weather_conditions, 0.0)
+    soft_props = tyre_props[soft_set.compound]
+    if start_weather:
+        probe_decel = start_weather.deceleration_multiplier
+        probe_friction = {
+            WeatherType.DRY: soft_props.dry_friction_multiplier,
+            WeatherType.COLD: soft_props.cold_friction_multiplier,
+            WeatherType.LIGHT_RAIN: soft_props.light_rain_friction_multiplier,
+            WeatherType.HEAVY_RAIN: soft_props.heavy_rain_friction_multiplier,
+        }.get(start_weather.condition, soft_props.dry_friction_multiplier)
+    else:
+        probe_decel = 1.0
+        probe_friction = soft_props.dry_friction_multiplier
+    probe_actions = _build_straight_actions_for_compound(
+        config, lam, soft_set.compound, probe_friction, probe_decel
+    )
  
     def _assemble_laps(actions_by_lap, pit_map):
         laps_out = []
@@ -866,48 +938,46 @@ def build_level3_strategy(config, lam: float, change_intervals: list) -> RaceStr
             ))
         return laps_out
  
-    probe_by_lap = {ln: probe_actions for ln in range(1, total_laps + 1)}
+    probe_by_lap   = {ln: probe_actions for ln in range(1, total_laps + 1)}
     probe_strategy = RaceStrategy(
         initial_tyre_id=soft_set.primary_id,
         laps=_assemble_laps(probe_by_lap, {}),
     )
-    probe_result   = simulate(config, probe_strategy, SimConfig(tyre_degradation=False, fuel_consumption=True))
+    probe_result   = simulate(config, probe_strategy,
+                               SimConfig(tyre_degradation=False, fuel_consumption=True))
     fuel_per_lap   = probe_result.lap_results[0].fuel_used_l
     avg_lap_time_s = probe_result.total_time_s / total_laps
- 
+
     # ------------------------------------------------------------------
-    # 2. Assign compound to each stint, pre-build actions per compound
+    # 2. Assign compound to each stint
     # ------------------------------------------------------------------
     stint_starts = sorted([1] + [l + 1 for l in forced_change_laps])
-    used_set_ids: set = set()
-    lap_tyre_set: Dict[int, Any] = {}
-    action_cache: Dict[str, Dict] = {}
+    used_set_ids: set         = set()
+    lap_tyre_set: Dict        = {}
+    action_cache: Dict        = {}
  
     for si, stint_start in enumerate(stint_starts):
-        stint_end  = (stint_starts[si + 1] - 1) if si + 1 < len(stint_starts) else total_laps
-        dom_weather = _dominant_weather(
-            weather_conditions,
-            stint_start * avg_lap_time_s,
-            stint_end   * avg_lap_time_s,
-        )
+        stint_end   = (stint_starts[si + 1] - 1) if si + 1 < len(stint_starts) else total_laps
+        stint_start_s = (stint_start - 1) * avg_lap_time_s
+        stint_end_s = stint_end * avg_lap_time_s
         available = [ts for ts in config.available_sets if ts.primary_id not in used_set_ids] \
                     or config.available_sets
-        chosen = _best_tyre_for_weather(dom_weather, available, tyre_props)
+        chosen = _best_tyre_for_window(
+            weather_conditions,
+            stint_start_s,
+            stint_end_s,
+            available,
+            tyre_props,
+        )
         used_set_ids.add(chosen.primary_id)
- 
-        # Cache straight actions for this compound (computed once per compound)
-        key = chosen.compound.value
-        if key not in action_cache:
-            worst_wt = _worst_friction_weather(tyre_props, chosen.compound, weather_conditions)
-            action_cache[key] = _build_straight_actions_for_compound(config, lam, chosen.compound, worst_wt)
  
         for lap in range(stint_start, stint_end + 1):
             lap_tyre_set[lap] = chosen
  
     # ------------------------------------------------------------------
-    # 3. Build pit schedule (fuel + tyre changes)
+    # 3. Fuel + tyre pit schedule
     # ------------------------------------------------------------------
-    pit_schedule: Dict[int, dict] = {}
+    pit_schedule: Dict = {}
     current_fuel = car.initial_fuel_l
  
     for lap_num in range(1, total_laps + 1):
@@ -931,14 +1001,33 @@ def build_level3_strategy(config, lam: float, change_intervals: list) -> RaceStr
                 current_fuel += refuel
  
     # ------------------------------------------------------------------
-    # 4. Assemble final RaceStrategy
+    # 4. Assemble final RaceStrategy with per-lap weather + tyre braking
     # ------------------------------------------------------------------
-    actions_by_lap = {
-        ln: action_cache[lap_tyre_set[ln].compound.value]
-        for ln in range(1, total_laps + 1)
-    }
- 
-    pit_map: Dict[int, PitAction] = {}
+    actions_by_lap: Dict = {}
+    # Probe lap-time based weather alignment drifts over a long race (pits/crashes/lambda effects).
+    # Expand each lap's weather window so action selection stays safe near transitions.
+    weather_window_pad_s = max(120.0, 0.35 * avg_lap_time_s)
+
+    for ln in range(1, total_laps + 1):
+        lap_start_s = (ln - 1) * avg_lap_time_s
+        lap_end_s = ln * avg_lap_time_s
+        window_start_s = max(0.0, lap_start_s - weather_window_pad_s)
+        window_end_s = lap_end_s + weather_window_pad_s
+        lap_decel = _min_decel_multiplier(weather_conditions, window_start_s, window_end_s)
+        compound = lap_tyre_set[ln].compound
+        props = tyre_props[compound]
+        lap_friction = _min_friction_multiplier(weather_conditions, window_start_s, window_end_s, props)
+        key = (compound.value, round(lap_friction, 4), round(lap_decel, 4))
+        if key not in action_cache:
+            action_cache[key] = _build_straight_actions_for_compound(
+                config,
+                lam,
+                compound,
+                lap_friction,
+                lap_decel,
+            )
+        actions_by_lap[ln] = action_cache[key]
+    pit_map: Dict = {}
     for lap_num, entry in pit_schedule.items():
         new_set = entry["tyre_set"]
         pit_map[lap_num] = PitAction(

@@ -148,16 +148,11 @@ from simulator import simulate, SimConfig
  
 def run_level3(cfg, output_path: str) -> None:
     """
-    Two-phase sweep for Level 3:
- 
-    Phase 1 — Interval sweep at lambda=1.0
-        Sweep all 1-stop and 2-stop tyre-change combinations (step 5 laps).
-        Best compound per stint chosen automatically from weather window.
-        Print table sorted by Score L3, identify best interval combo.
- 
-    Phase 2 — Lambda sweep at best interval combo
-        Sweep lambda 0.80 → 1.00 (step 0.01) with the winning intervals.
-        Print table, save best overall submission.
+    Single-phase sweep for Level 3 (lambda fixed at 1.00):
+
+    Sweep all 1-stop and 2-stop tyre-change interval combinations (step 5 laps).
+    Best compound per stint is chosen automatically from weather windows.
+    Print table sorted by Score L3 and save the best submission.
     """
     sim_cfg = SimConfig(tyre_degradation=False, fuel_consumption=True)
  
@@ -179,6 +174,7 @@ def run_level3(cfg, output_path: str) -> None:
  
     best_score_p1 = float('-inf')
     best_combo    = None
+    best_crashes_p1 = float('inf')
     p1_table      = []
  
     for combo in combos:
@@ -199,11 +195,16 @@ def run_level3(cfg, output_path: str) -> None:
         p1_table.append((combo, tyre_str, result.total_time_s,
                          result.total_fuel_used_l, pit_count, result.crashes, score))
  
-        if score > best_score_p1:
+        # Primary objective: avoid crashes. Secondary: maximize score.
+        if (result.crashes < best_crashes_p1) or (
+            result.crashes == best_crashes_p1 and score > best_score_p1
+        ):
+            best_crashes_p1 = result.crashes
             best_score_p1 = score
-            best_combo    = combo
+            best_combo = combo
  
-    p1_table.sort(key=lambda r: r[6], reverse=True)
+    # Show safer options first; break ties by higher score.
+    p1_table.sort(key=lambda r: (r[5], -r[6]))
     for combo, tyre_str, t, fuel, pits, crashes, score in p1_table[:20]:
         marker = " ◄ best" if combo == best_combo else ""
         print(f"  {str(combo):>18}  {tyre_str:>28}  {t:>10.2f}  "
@@ -214,45 +215,12 @@ def run_level3(cfg, output_path: str) -> None:
  
     print(f"\n  Best interval combo: {best_combo}  |  Score: {best_score_p1:,.2f}\n")
  
-    # ------------------------------------------------------------------
-    # Phase 2: lambda sweep at best interval combo
-    # ------------------------------------------------------------------
-    lam_values = [round(v * 0.01, 2) for v in range(80, 101)]   # 0.80 → 1.00
- 
-    print(f"--- Level 3 Phase 2: Lambda Sweep at intervals={best_combo} ---")
-    print(f"  {'Lambda':>7}  {'Time (s)':>12}  {'Fuel (L)':>10}  "
-          f"{'Pits':>5}  {'Crashes':>8}  {'Score L3':>14}")
-    print("  " + "-" * 72)
- 
-    best_score    = float('-inf')
-    best_lam      = None
-    best_strategy = None
-    best_result   = None
-    p2_table      = []
- 
-    for lam in lam_values:
-        strategy = build_level3_strategy(cfg, lam, list(best_combo))
-        result   = simulate(cfg, strategy, sim_cfg)
-        score    = result.score_level3(cfg)
-        pit_count = sum(1 for ls in strategy.laps if ls.pit.enter)
- 
-        p2_table.append((lam, result.total_time_s, result.total_fuel_used_l,
-                         pit_count, result.crashes, score))
- 
-        if score > best_score:
-            best_score    = score
-            best_lam      = lam
-            best_strategy = strategy
-            best_result   = result
- 
-    p2_table.sort(key=lambda r: r[5], reverse=True)
-    for lam, t, fuel, pits, crashes, score in p2_table:
-        marker = " ◄ best" if lam == best_lam else ""
-        print(f"  {lam:>7.2f}  {t:>12.2f}  {fuel:>10.4f}  "
-              f"{pits:>5}  {crashes:>8}  {score:>14,.2f}{marker}")
+    best_strategy = build_level3_strategy(cfg, 1.0, list(best_combo))
+    best_result = simulate(cfg, best_strategy, sim_cfg)
+    best_score = best_result.score_level3(cfg)
  
     print()
-    print(f"Best lambda    : {best_lam:.2f}")
+    print("Best lambda    : 1.00")
     print(f"Best intervals : {best_combo}")
     print(f"Best score     : {best_score:,.2f}")
     print(f"Total time     : {best_result.total_time_s:.2f} s  "
