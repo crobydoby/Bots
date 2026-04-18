@@ -141,89 +141,118 @@ def main():
     else:
         run_level1(cfg, output_path)
 
+
+from strategy import build_level3_strategy, save_strategy
+from simulator import simulate, SimConfig
+ 
+ 
 def run_level3(cfg, output_path: str) -> None:
     """
-    Sweep every combination of 1–2 tyre-change laps across the race.
-    For each combination:
-      - Lambda is fixed at 1.0 (max speed); the bottleneck at level 3 is
-        tyre/weather strategy, not speed tuning.
-      - The best tyre compound for each stint is chosen automatically based
-        on the dominant weather in that window.
-      - Fuel pits are inserted greedily (same rule as Level 2).
+    Two-phase sweep for Level 3:
  
-    Sweep grid:
-      Single stop  : change on lap N  for N in [10, 15, 20 … 60]  (step 5)
-      Double stop  : change on laps (N1, N2) for all N1 < N2      (step 5)
+    Phase 1 — Interval sweep at lambda=1.0
+        Sweep all 1-stop and 2-stop tyre-change combinations (step 5 laps).
+        Best compound per stint chosen automatically from weather window.
+        Print table sorted by Score L3, identify best interval combo.
  
-    Print table sorted by Score (L3), save best submission.
+    Phase 2 — Lambda sweep at best interval combo
+        Sweep lambda 0.80 → 1.00 (step 0.01) with the winning intervals.
+        Print table, save best overall submission.
     """
-    from strategy import build_level3_strategy, save_strategy
-    from simulator import simulate, SimConfig
- 
     sim_cfg = SimConfig(tyre_degradation=False, fuel_consumption=True)
-    lam = 1.0
  
-    # Candidate lap numbers for tyre changes (exclude lap 1 and final lap)
     candidates = list(range(10, cfg.race.laps - 5, 5))   # 10, 15, 20 … 60
  
-    # Build all interval combinations: 1-stop and 2-stop
-    combos = []
-    for n in candidates:
-        combos.append((n,))
+    combos = [(n,) for n in candidates]
     for i, n1 in enumerate(candidates):
         for n2 in candidates[i + 1:]:
             combos.append((n1, n2))
  
-    print("--- Level 3 Tyre-Change Interval Sweep ---")
-    print(f"  Lambda fixed at {lam:.2f}  |  {len(combos)} combinations")
-    print(f"  {'Intervals':>18}  {'Tyres':>22}  {'Time (s)':>10}  "
+    # ------------------------------------------------------------------
+    # Phase 1: interval sweep at lam = 1.0
+    # ------------------------------------------------------------------
+    print("--- Level 3 Phase 1: Tyre-Change Interval Sweep (lambda=1.00) ---")
+    print(f"  {len(combos)} combinations")
+    print(f"  {'Intervals':>18}  {'Tyres':>28}  {'Time (s)':>10}  "
           f"{'Fuel (L)':>10}  {'Pits':>5}  {'Crashes':>8}  {'Score L3':>14}")
-    print("  " + "-" * 120)
+    print("  " + "-" * 105)
  
-    best_score    = float('-inf')
+    best_score_p1 = float('-inf')
     best_combo    = None
-    best_strategy = None
-    best_result   = None
- 
-    results_table = []
+    p1_table      = []
  
     for combo in combos:
-        strategy = build_level3_strategy(cfg, lam, list(combo))
+        strategy = build_level3_strategy(cfg, 1.0, list(combo))
         result   = simulate(cfg, strategy, sim_cfg)
-        score    = result.score_level2(cfg)   # L3 uses same formula as L2 (time + fuel bonus)
- 
+        score    = result.score_level3(cfg)
         pit_count = sum(1 for ls in strategy.laps if ls.pit.enter)
  
-        # Collect tyre compounds used per stint (for display)
         tyre_labels = []
-        current_id  = strategy.initial_tyre_id
         for ls in strategy.laps:
             if ls.pit.enter and ls.pit.tyre_change_set_id is not None:
-                current_id = ls.pit.tyre_change_set_id
-                tset = next((s for s in cfg.available_sets if s.primary_id == current_id), None)
+                tset = next((s for s in cfg.available_sets
+                             if s.primary_id == ls.pit.tyre_change_set_id), None)
                 if tset:
                     tyre_labels.append(f"L{ls.lap}:{tset.compound.value[:3]}")
         tyre_str = ",".join(tyre_labels) if tyre_labels else "no change"
  
-        interval_str = str(combo)
-        results_table.append((combo, interval_str, tyre_str,
-                               result.total_time_s, result.total_fuel_used_l,
-                               pit_count, result.crashes, score))
+        p1_table.append((combo, tyre_str, result.total_time_s,
+                         result.total_fuel_used_l, pit_count, result.crashes, score))
+ 
+        if score > best_score_p1:
+            best_score_p1 = score
+            best_combo    = combo
+ 
+    p1_table.sort(key=lambda r: r[6], reverse=True)
+    for combo, tyre_str, t, fuel, pits, crashes, score in p1_table[:20]:
+        marker = " ◄ best" if combo == best_combo else ""
+        print(f"  {str(combo):>18}  {tyre_str:>28}  {t:>10.2f}  "
+              f"{fuel:>10.4f}  {pits:>5}  {crashes:>8}  {score:>14,.2f}{marker}")
+ 
+    if len(p1_table) > 20:
+        print(f"  ... ({len(p1_table) - 20} more not shown)")
+ 
+    print(f"\n  Best interval combo: {best_combo}  |  Score: {best_score_p1:,.2f}\n")
+ 
+    # ------------------------------------------------------------------
+    # Phase 2: lambda sweep at best interval combo
+    # ------------------------------------------------------------------
+    lam_values = [round(v * 0.01, 2) for v in range(80, 101)]   # 0.80 → 1.00
+ 
+    print(f"--- Level 3 Phase 2: Lambda Sweep at intervals={best_combo} ---")
+    print(f"  {'Lambda':>7}  {'Time (s)':>12}  {'Fuel (L)':>10}  "
+          f"{'Pits':>5}  {'Crashes':>8}  {'Score L3':>14}")
+    print("  " + "-" * 72)
+ 
+    best_score    = float('-inf')
+    best_lam      = None
+    best_strategy = None
+    best_result   = None
+    p2_table      = []
+ 
+    for lam in lam_values:
+        strategy = build_level3_strategy(cfg, lam, list(best_combo))
+        result   = simulate(cfg, strategy, sim_cfg)
+        score    = result.score_level3(cfg)
+        pit_count = sum(1 for ls in strategy.laps if ls.pit.enter)
+ 
+        p2_table.append((lam, result.total_time_s, result.total_fuel_used_l,
+                         pit_count, result.crashes, score))
  
         if score > best_score:
             best_score    = score
-            best_combo    = combo
+            best_lam      = lam
             best_strategy = strategy
             best_result   = result
  
-    # Sort by score descending, print all combinations
-    results_table.sort(key=lambda r: r[7], reverse=True)
-    for combo, interval_str, tyre_str, t, fuel, pits, crashes, score in results_table:
-        marker = " ◄ best" if combo == best_combo else ""
-        print(f"  {interval_str:>18}  {tyre_str:>22}  {t:>10.2f}  "
-              f"{fuel:>10.4f}  {pits:>5}  {crashes:>8}  {score:>14,.2f}{marker}")
+    p2_table.sort(key=lambda r: r[5], reverse=True)
+    for lam, t, fuel, pits, crashes, score in p2_table:
+        marker = " ◄ best" if lam == best_lam else ""
+        print(f"  {lam:>7.2f}  {t:>12.2f}  {fuel:>10.4f}  "
+              f"{pits:>5}  {crashes:>8}  {score:>14,.2f}{marker}")
  
     print()
+    print(f"Best lambda    : {best_lam:.2f}")
     print(f"Best intervals : {best_combo}")
     print(f"Best score     : {best_score:,.2f}")
     print(f"Total time     : {best_result.total_time_s:.2f} s  "
@@ -234,24 +263,24 @@ def run_level3(cfg, output_path: str) -> None:
     print(f"Crashes        : {best_result.crashes}")
     print()
  
-    # Per-lap summary for best strategy
-    print("  Lap  |  Time (s)  | Pit (s) | Fuel (L) | Tyre | Crashes")
-    print("  " + "-" * 60)
+    # Per-lap summary
+    print("  Lap  |  Time (s)  | Pit (s) | Fuel (L) | Tyre change | Crashes")
+    print("  " + "-" * 65)
     for lr in best_result.lap_results:
-        # Find tyre for this lap
         lap_strat = best_strategy.laps[lr.lap - 1]
         tyre_note = ""
         if lap_strat.pit.enter and lap_strat.pit.tyre_change_set_id is not None:
             tset = next((s for s in cfg.available_sets
                          if s.primary_id == lap_strat.pit.tyre_change_set_id), None)
-            tyre_note = f"→{tset.compound.value[:3]}" if tset else "→?"
+            tyre_note = f"→ {tset.compound.value}" if tset else "→ ?"
         print(
             f"  {lr.lap:>3}  | {lr.time_s:>10.2f} | {lr.pit_time_s:>7.1f} "
-            f"| {lr.fuel_used_l:>8.4f} | {tyre_note:>4} | {lr.crashes:>7}"
+            f"| {lr.fuel_used_l:>8.4f} | {tyre_note:<11} | {lr.crashes:>7}"
         )
  
     save_strategy(best_strategy, output_path)
     print(f"\nBest submission written to: {output_path}")
+ 
  
  
 # ---------------------------------------------------------------------------

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 strategy.py
 -----------
@@ -5,7 +6,6 @@ Dataclasses for representing a race strategy and a serialiser that produces
 the required submission JSON format.
 """
 
-from __future__ import annotations
 
 import json
 import math
@@ -542,13 +542,14 @@ def build_level3_strategy(config, lam: float, change_intervals: list) -> "RaceSt
  
     # ---- Pre-compute per-straight actions (same as Level 2) ----
     # Start with the initial tyre to determine corner exit speeds.
-    # For level 3 we use no degradation margin in pre-computation (dynamic).
+    # For level 3 we keep braking conservative by using the weakest weather
+    # deceleration multiplier seen in the level file.
     initial_set = config.available_sets[0]
     tyre_state  = TyreState(tyre_set=initial_set)
     start_weather = config.weather_conditions[0] if config.weather_conditions else None
     from models import WeatherType
     weather_type = start_weather.condition if start_weather else WeatherType.DRY
- 
+
     _, _required_exit = _make_corner_helpers(car, segments, tyre_state, weather_type,
                                              corner_speed_margin=0.0)
  
@@ -686,3 +687,267 @@ def build_level3_strategy(config, lam: float, change_intervals: list) -> "RaceSt
  
     return RaceStrategy(initial_tyre_id=initial_tyre.primary_id, laps=laps_out)
  
+ # ---------------------------------------------------------------------------
+# Level 3 helpers
+# ---------------------------------------------------------------------------
+ 
+def _weather_at(weather_conditions, time_s: float):
+    """Return the WeatherCondition active at elapsed time time_s."""
+    if not weather_conditions:
+        return None
+    cycle = sum(w.duration_s for w in weather_conditions)
+    t = time_s % cycle
+    acc = 0.0
+    for w in weather_conditions:
+        acc += w.duration_s
+        if t < acc:
+            return w
+    return weather_conditions[-1]
+ 
+ 
+def _dominant_weather(weather_conditions, start_s: float, end_s: float):
+    """Weather condition covering the most time in [start_s, end_s]."""
+    from collections import defaultdict
+    from models import WeatherType
+    if not weather_conditions:
+        return WeatherType.DRY
+    coverage: Dict = defaultdict(float)
+    step = 30.0
+    t = start_s
+    while t < end_s:
+        w = _weather_at(weather_conditions, t)
+        if w:
+            coverage[w.condition] += min(step, end_s - t)
+        t += step
+    return max(coverage, key=coverage.get) if coverage else WeatherType.DRY
+ 
+ 
+def _worst_friction_weather(tyre_props, compound, weather_conditions):
+    """
+    Return the WeatherType that gives the LOWEST tyre friction for `compound`.
+    Used to size brake distances conservatively so they are safe under every
+    possible weather condition in the level.
+    """
+    from models import WeatherType
+    attr_map = {
+        WeatherType.DRY:        "dry_friction_multiplier",
+        WeatherType.COLD:       "cold_friction_multiplier",
+        WeatherType.LIGHT_RAIN: "light_rain_friction_multiplier",
+        WeatherType.HEAVY_RAIN: "heavy_rain_friction_multiplier",
+    }
+    props = tyre_props[compound]
+    seen = {w.condition for w in weather_conditions} if weather_conditions else {WeatherType.DRY}
+ 
+    worst_weather, worst_friction = WeatherType.DRY, float('inf')
+    for wt in seen:
+        attr = attr_map.get(wt, "dry_friction_multiplier")
+        friction = props.life_span * getattr(props, attr, 1.0)
+        if friction < worst_friction:
+            worst_friction = friction
+            worst_weather  = wt
+    return worst_weather
+ 
+ 
+def _best_tyre_for_weather(weather_type, candidate_sets, tyre_props):
+    """Pick the set with highest base_friction * weather_mult for the given weather."""
+    from models import WeatherType
+    attr_map = {
+        WeatherType.DRY:        "dry_friction_multiplier",
+        WeatherType.COLD:       "cold_friction_multiplier",
+        WeatherType.LIGHT_RAIN: "light_rain_friction_multiplier",
+        WeatherType.HEAVY_RAIN: "heavy_rain_friction_multiplier",
+    }
+    attr = attr_map.get(weather_type, "dry_friction_multiplier")
+    best_set, best_score = None, -1.0
+    for tset in candidate_sets:
+        props = tyre_props[tset.compound]
+        score = props.life_span * getattr(props, attr, 1.0)
+        if score > best_score:
+            best_score, best_set = score, tset
+    return best_set
+ 
+ 
+def _build_straight_actions_for_compound(config, lam: float, compound, worst_weather_type) -> Dict[int, "StraightAction"]:
+    """
+    Build straight actions for a compound sized for its worst-case weather friction.
+    This guarantees brake distances are always sufficient regardless of actual weather.
+    """
+    from models import SegmentType, TyreState
+ 
+    car      = config.car
+    segments = config.track.segments
+ 
+    tyre_set   = next(ts for ts in config.available_sets if ts.compound == compound)
+    tyre_state = TyreState(tyre_set=tyre_set)
+ 
+    _, _required_exit = _make_corner_helpers(
+        car, segments, tyre_state, worst_weather_type,
+        corner_speed_margin=0.5,
+    )
+ 
+    target_speed = lam * car.max_speed_m_s
+ 
+    prev_is_straight = {
+        seg.id
+        for i, seg in enumerate(segments)
+        if seg.type == SegmentType.STRAIGHT and i > 0
+        and segments[i - 1].type == SegmentType.STRAIGHT
+    }
+ 
+    actions: Dict[int, StraightAction] = {}
+    for idx, seg in enumerate(segments):
+        if seg.type != SegmentType.STRAIGHT:
+            continue
+        req_exit = _required_exit(idx)
+        cruise   = min(max(target_speed, req_exit), car.max_speed_m_s)
+        brake_frm = car.max_speed_m_s if seg.id in prev_is_straight else cruise
+        bd = (brake_frm ** 2 - req_exit ** 2) / (2 * car.brake_m_se2) if brake_frm > req_exit else 0.0
+        bd = min(bd, seg.length_m)
+        actions[seg.id] = StraightAction(
+            segment_id=seg.id,
+            target_m_s=round(cruise, 4),
+            brake_start_m_before_next=round(bd, 2),
+        )
+    return actions
+ 
+ 
+# ---------------------------------------------------------------------------
+# Level 3: weather-aware strategy with tyre-change sweep
+# ---------------------------------------------------------------------------
+ 
+def build_level3_strategy(config, lam: float, change_intervals: list) -> RaceStrategy:
+    """
+    Weather + fuel aware strategy for Level 3.
+ 
+    Brake distances are computed per compound using the WORST-CASE weather
+    multiplier for that compound across all conditions in the level file.
+    This eliminates crashes caused by weather-dependent friction changes.
+ 
+    Parameters
+    ----------
+    config           : LevelConfig
+    lam              : float       — speed scaling factor (0, 1]
+    change_intervals : list[int]   — lap numbers for forced tyre changes
+ 
+    Returns
+    -------
+    RaceStrategy
+    """
+    from models import SegmentType, WeatherType, TyreState
+    from simulator import simulate, SimConfig
+ 
+    car        = config.car
+    segments   = config.track.segments
+    total_laps = config.race.laps
+    tyre_props = config.tyre_properties
+    weather_conditions = config.weather_conditions
+ 
+    forced_change_laps = {l for l in change_intervals if 1 <= l < total_laps}
+ 
+    # ------------------------------------------------------------------
+    # 1. Probe run to get fuel/lap and avg lap time
+    # ------------------------------------------------------------------
+    soft_set = next(ts for ts in config.available_sets if ts.compound.value == "Soft")
+    soft_worst = _worst_friction_weather(tyre_props, soft_set.compound, weather_conditions)
+    probe_actions = _build_straight_actions_for_compound(config, lam, soft_set.compound, soft_worst)
+ 
+    def _assemble_laps(actions_by_lap, pit_map):
+        laps_out = []
+        for ln in range(1, total_laps + 1):
+            acts = list(actions_by_lap[ln].values()) + [
+                CornerAction(segment_id=s.id)
+                for s in segments if s.type == SegmentType.CORNER
+            ]
+            acts.sort(key=lambda a: a.segment_id)
+            laps_out.append(LapStrategy(
+                lap=ln,
+                segment_actions=acts,
+                pit=pit_map.get(ln, PitAction(enter=False)),
+            ))
+        return laps_out
+ 
+    probe_by_lap = {ln: probe_actions for ln in range(1, total_laps + 1)}
+    probe_strategy = RaceStrategy(
+        initial_tyre_id=soft_set.primary_id,
+        laps=_assemble_laps(probe_by_lap, {}),
+    )
+    probe_result   = simulate(config, probe_strategy, SimConfig(tyre_degradation=False, fuel_consumption=True))
+    fuel_per_lap   = probe_result.lap_results[0].fuel_used_l
+    avg_lap_time_s = probe_result.total_time_s / total_laps
+ 
+    # ------------------------------------------------------------------
+    # 2. Assign compound to each stint, pre-build actions per compound
+    # ------------------------------------------------------------------
+    stint_starts = sorted([1] + [l + 1 for l in forced_change_laps])
+    used_set_ids: set = set()
+    lap_tyre_set: Dict[int, Any] = {}
+    action_cache: Dict[str, Dict] = {}
+ 
+    for si, stint_start in enumerate(stint_starts):
+        stint_end  = (stint_starts[si + 1] - 1) if si + 1 < len(stint_starts) else total_laps
+        dom_weather = _dominant_weather(
+            weather_conditions,
+            stint_start * avg_lap_time_s,
+            stint_end   * avg_lap_time_s,
+        )
+        available = [ts for ts in config.available_sets if ts.primary_id not in used_set_ids] \
+                    or config.available_sets
+        chosen = _best_tyre_for_weather(dom_weather, available, tyre_props)
+        used_set_ids.add(chosen.primary_id)
+ 
+        # Cache straight actions for this compound (computed once per compound)
+        key = chosen.compound.value
+        if key not in action_cache:
+            worst_wt = _worst_friction_weather(tyre_props, chosen.compound, weather_conditions)
+            action_cache[key] = _build_straight_actions_for_compound(config, lam, chosen.compound, worst_wt)
+ 
+        for lap in range(stint_start, stint_end + 1):
+            lap_tyre_set[lap] = chosen
+ 
+    # ------------------------------------------------------------------
+    # 3. Build pit schedule (fuel + tyre changes)
+    # ------------------------------------------------------------------
+    pit_schedule: Dict[int, dict] = {}
+    current_fuel = car.initial_fuel_l
+ 
+    for lap_num in range(1, total_laps + 1):
+        current_fuel -= fuel_per_lap
+        current_fuel  = max(current_fuel, 0.0)
+        if lap_num == total_laps:
+            break
+ 
+        needs_tyre = lap_num in forced_change_laps
+        needs_fuel = current_fuel < fuel_per_lap
+ 
+        if needs_tyre or needs_fuel:
+            remaining_after = total_laps - lap_num
+            refuel = 0.0
+            if needs_fuel:
+                refuel = round(min(remaining_after * fuel_per_lap,
+                                   car.fuel_tank_capacity_l - current_fuel), 4)
+            new_set = lap_tyre_set.get(lap_num + 1) if needs_tyre else None
+            pit_schedule[lap_num] = {"fuel": refuel, "tyre_set": new_set}
+            if refuel > 0:
+                current_fuel += refuel
+ 
+    # ------------------------------------------------------------------
+    # 4. Assemble final RaceStrategy
+    # ------------------------------------------------------------------
+    actions_by_lap = {
+        ln: action_cache[lap_tyre_set[ln].compound.value]
+        for ln in range(1, total_laps + 1)
+    }
+ 
+    pit_map: Dict[int, PitAction] = {}
+    for lap_num, entry in pit_schedule.items():
+        new_set = entry["tyre_set"]
+        pit_map[lap_num] = PitAction(
+            enter=True,
+            tyre_change_set_id=new_set.primary_id if new_set else None,
+            fuel_refuel_amount_l=entry["fuel"],
+        )
+ 
+    return RaceStrategy(
+        initial_tyre_id=lap_tyre_set[1].primary_id,
+        laps=_assemble_laps(actions_by_lap, pit_map),
+    )
