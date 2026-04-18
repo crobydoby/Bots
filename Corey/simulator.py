@@ -8,6 +8,15 @@ a SimResult containing total race time, fuel used, tyre degradation,
 blowout count, and a per-lap breakdown.
 
 All physics formulas are taken verbatim from the problem statement.
+
+Level modes
+-----------
+Pass a SimConfig to simulate() to control which mechanics are active:
+
+    SimConfig(tyre_degradation=False, fuel_consumption=False)
+
+This disables tyre degradation and fuel consumption entirely, leaving only
+straight-speed / braking-point optimisation (Level 1 without degradation).
 """
 
 from __future__ import annotations
@@ -22,6 +31,40 @@ from models import (
     GRAVITY, K_STRAIGHT, K_BRAKING, K_CORNER, K_BASE, K_DRAG,
 )
 from strategy import RaceStrategy, StraightAction, CornerAction, PitAction, LapStrategy
+
+
+# ---------------------------------------------------------------------------
+# Simulation configuration flags
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SimConfig:
+    """
+    Controls which mechanics are active during simulation.
+
+    Attributes
+    ----------
+    tyre_degradation : bool
+        When False, tyres never degrade and blowouts cannot occur.
+        Corner max speeds are computed from the tyre's full life_span friction,
+        and remain constant for the entire race.  Default: True.
+    fuel_consumption : bool
+        When False, fuel is treated as unlimited — consumption is not tracked
+        and the car never enters limp mode due to empty fuel.  Default: True.
+    """
+    tyre_degradation: bool = True
+    fuel_consumption: bool = True
+
+    @classmethod
+    def simple(cls) -> "SimConfig":
+        """Level 1 variant: no tyre degradation, unlimited fuel.
+        Only straight-speed and braking-point decisions matter."""
+        return cls(tyre_degradation=False, fuel_consumption=False)
+
+    @classmethod
+    def full(cls) -> "SimConfig":
+        """Full simulation: all mechanics active (Levels 2–4)."""
+        return cls(tyre_degradation=True, fuel_consumption=True)
 
 
 # ---------------------------------------------------------------------------
@@ -154,31 +197,39 @@ def _simulate_straight(
     state: _RaceState,
     car: Car,
     weather: WeatherCondition,
+    sim_cfg: SimConfig,
 ) -> SegmentResult:
     """
     Simulate one straight segment.
 
-    Phase 1: Accelerate from entry speed toward target_m_s (if not in limp/crawl).
-    Phase 2: Cruise at target_m_s (or entry speed if speed-follow-through applies).
-    Phase 3: Brake from braking_point to end of segment.
+    The submission engine model (verified against ground-truth logs):
+      Phase 1: Accelerate from entry speed to target_m_s.
+      Phase 2: Cruise at target_m_s.
+      Phase 3: Brake over brake_start_m_before_next metres.
+               exit_speed = sqrt(target_m_s² - 2 * brake * brake_dist)
+
+    All three distances must sum to seg.length_m. If accel+brake > length
+    (no room to reach target speed), the car peaks at the speed that can be
+    reached and braked back to within the available distance.
+
+    Tyre degradation is computed per-phase; fuel likewise.
     """
-    seg_length   = seg.length_m
-    entry_speed  = state.speed_m_s
-    crashed      = False
-    limp         = state.limp_mode
-    crawl        = state.crawl_mode
+    seg_length  = seg.length_m
+    entry_speed = state.speed_m_s
+    limp        = state.limp_mode
+    crawl       = state.crawl_mode
 
     accel = car.accel_m_se2 * weather.acceleration_multiplier
     brake = car.brake_m_se2 * weather.deceleration_multiplier
 
     # ---- Limp or crawl mode: constant speed, no accel/decel ----
     if limp:
-        speed       = car.limp_constant_m_s
-        seg_time    = _time_at_constant(seg_length, speed)
-        fuel        = _fuel_used(speed, speed, seg_length)
-        deg         = _tyre_degrade_straight(seg_length, state.tyre, weather)
+        speed    = car.limp_constant_m_s
+        seg_time = _time_at_constant(seg_length, speed)
+        fuel     = _fuel_used(speed, speed, seg_length) if sim_cfg.fuel_consumption else 0.0
+        deg      = _tyre_degrade_straight(seg_length, state.tyre, weather) if sim_cfg.tyre_degradation else 0.0
 
-        _update_state(state, speed, fuel, seg_time, deg)
+        _update_state(state, speed, fuel, seg_time, deg, sim_cfg)
         return SegmentResult(
             segment_id=seg.id, segment_type="straight",
             time_s=seg_time, fuel_used_l=fuel,
@@ -188,83 +239,54 @@ def _simulate_straight(
         )
 
     if crawl:
-        # Crawl mode: constant speed until this straight, then can accelerate again
-        # The problem states crawl mode ends on encountering a straight
+        # Crawl mode ends on encountering a straight; car resumes from crawl speed
         state.crawl_mode = False
-        crawl = False
         entry_speed = car.crawl_constant_m_s
         state.speed_m_s = entry_speed
 
     # ---- Normal straight ----
-    target_speed   = min(action.target_m_s, car.max_speed_m_s)
-    brake_dist     = action.brake_start_m_before_next   # metres before segment end
-    brake_start_at = seg_length - brake_dist             # position along segment
-
-    # Speed follow-through: if entry speed > target speed, just continue at entry speed
+    target_speed = min(action.target_m_s, car.max_speed_m_s)
+    # Speed follow-through: if entry already exceeds target, treat as cruise at entry
     cruise_speed = max(target_speed, entry_speed)
+    brake_dist   = action.brake_start_m_before_next   # metres at end of segment
 
-    total_time = 0.0
+    # Distance to accelerate from entry to cruise_speed
+    if entry_speed < cruise_speed and accel > 0:
+        accel_dist = (cruise_speed ** 2 - entry_speed ** 2) / (2 * accel)
+    else:
+        accel_dist = 0.0
+
+    cruise_dist = max(0.0, seg_length - accel_dist - brake_dist)
+
+    # Exit speed from braking phase (submission engine formula)
+    v_after_brake = math.sqrt(max(cruise_speed ** 2 - 2 * brake * brake_dist, 0.0))
+    exit_speed    = v_after_brake
+
+    # Times per phase
+    t_accel  = (cruise_speed - entry_speed) / accel if accel > 0 and entry_speed < cruise_speed else 0.0
+    t_cruise = cruise_dist / cruise_speed if cruise_speed > 0 else 0.0
+    t_brake  = (cruise_speed - exit_speed) / brake if brake > 0 and cruise_speed > exit_speed else 0.0
+    total_time = t_accel + t_cruise + t_brake
+
+    # Fuel and degradation per phase
     total_fuel = 0.0
     total_deg  = 0.0
-    pos        = 0.0          # current position along segment (m)
-    cur_speed  = entry_speed
 
-    # -- Phase 1: acceleration --
-    if cur_speed < cruise_speed and pos < brake_start_at:
-        d_accel = min(
-            _accel_distance(cur_speed, cruise_speed, accel),
-            brake_start_at - pos,
-        )
-        t_accel     = _accel_time(cur_speed, cur_speed + (2 * accel * d_accel) ** 0.5 if d_accel > 0 else cur_speed, accel)
-        # Recalculate actual speed reached given distance available
-        v_end_accel = min(
-            cruise_speed,
-            math.sqrt(cur_speed ** 2 + 2 * accel * min(d_accel, brake_start_at - pos))
-        )
-        d_accel_actual = (v_end_accel ** 2 - cur_speed ** 2) / (2 * accel) if accel > 0 else 0.0
-        t_accel        = _accel_time(cur_speed, v_end_accel, accel)
+    if sim_cfg.fuel_consumption:
+        total_fuel = (_fuel_used(entry_speed, cruise_speed, accel_dist)
+                      + _fuel_used(cruise_speed, cruise_speed, cruise_dist)
+                      + _fuel_used(cruise_speed, exit_speed, brake_dist))
 
-        total_fuel += _fuel_used(cur_speed, v_end_accel, d_accel_actual)
-        total_deg  += _tyre_degrade_straight(d_accel_actual, state.tyre, weather)
-        total_time += t_accel
-        pos        += d_accel_actual
-        cur_speed   = v_end_accel
+    if sim_cfg.tyre_degradation:
+        total_deg = (_tyre_degrade_straight(accel_dist + cruise_dist, state.tyre, weather)
+                     + _tyre_degrade_braking(cruise_speed, exit_speed, state.tyre, weather))
 
-    # -- Phase 2: cruise --
-    cruise_dist = max(0.0, brake_start_at - pos)
-    if cruise_dist > 0 and cur_speed > 0:
-        total_time += _time_at_constant(cruise_dist, cur_speed)
-        total_fuel += _fuel_used(cur_speed, cur_speed, cruise_dist)
-        total_deg  += _tyre_degrade_straight(cruise_dist, state.tyre, weather)
-        pos        += cruise_dist
-
-    # -- Phase 3: braking --
-    brake_seg_len = seg_length - pos
-    if brake_seg_len > 0 and brake > 0 and cur_speed > 0:
-        # We decelerate to whatever speed physics allows over brake_seg_len
-        v_end_brake = max(
-            math.sqrt(max(cur_speed ** 2 - 2 * brake * brake_seg_len, 0.0)),
-            0.0
-        )
-        t_brake = (cur_speed - v_end_brake) / brake if brake > 0 else 0.0
-
-        # Tyre braking degradation
-        deg_brake = _tyre_degrade_braking(cur_speed, v_end_brake, state.tyre, weather)
-
-        total_time += t_brake
-        total_fuel += _fuel_used(cur_speed, v_end_brake, brake_seg_len)
-        total_deg  += deg_brake
-        cur_speed   = v_end_brake
-        pos        += brake_seg_len
-
-    exit_speed = cur_speed
-
-    # Check fuel
-    if state.fuel_l - total_fuel <= 0:
+    # Fuel check (only when fuel consumption is active)
+    if sim_cfg.fuel_consumption and state.fuel_l - total_fuel <= 0:
         state.limp_mode = True
-        total_fuel = state.fuel_l  # can't use more than we have
+        total_fuel = state.fuel_l
 
-    _update_state(state, exit_speed, total_fuel, total_time, total_deg)
+    _update_state(state, exit_speed, total_fuel, total_time, total_deg, sim_cfg)
 
     return SegmentResult(
         segment_id=seg.id, segment_type="straight",
@@ -283,48 +305,60 @@ def _simulate_corner(
     state: _RaceState,
     car: Car,
     weather: WeatherCondition,
+    sim_cfg: SimConfig,
 ) -> SegmentResult:
     """
     Simulate one corner.
     Speed is constant throughout a corner (= entry speed).
     If entry speed > max_corner_speed → crash.
+
+    When sim_cfg.tyre_degradation is False, the tyre's full life_span friction
+    is used for the corner speed limit (no degradation ever occurred), and no
+    degradation is accumulated.
     """
     entry_speed = state.speed_m_s
     crashed     = False
 
-    tyre_friction = state.tyre.current_friction(weather.condition)
-    max_speed     = _max_corner_speed(tyre_friction, seg.radius_m, car.crawl_constant_m_s)
+    # Use current (possibly degraded) friction, or full life_span friction when
+    # degradation is disabled.
+    if sim_cfg.tyre_degradation:
+        tyre_friction = state.tyre.current_friction(weather.condition)
+    else:
+        from models import TYRE_PROPERTIES
+        props = TYRE_PROPERTIES[state.tyre.tyre_set.compound]
+        tyre_friction = props.life_span * props.friction_multiplier(weather.condition)
+
+    max_speed = _max_corner_speed(tyre_friction, seg.radius_m, car.crawl_constant_m_s)
 
     if state.limp_mode:
         corner_speed = car.limp_constant_m_s
     elif state.crawl_mode:
         corner_speed = car.crawl_constant_m_s
     elif entry_speed > max_speed:
-        # Crash: crawl mode + penalty tyre degradation
         crashed = True
         state.crashes += 1
         state.crawl_mode = True
         corner_speed = car.crawl_constant_m_s
-        # Flat 0.1 degradation penalty on crash
-        state.tyre.total_degradation += 0.1
+        if sim_cfg.tyre_degradation:
+            state.tyre.total_degradation += 0.1  # crash penalty
     else:
         corner_speed = entry_speed
 
     seg_time = _time_at_constant(seg.length_m, corner_speed) if corner_speed > 0 else float('inf')
-    fuel     = _fuel_used(corner_speed, corner_speed, seg.length_m)
-    deg      = _tyre_degrade_corner(corner_speed, seg.radius_m, state.tyre, weather)
+    fuel     = _fuel_used(corner_speed, corner_speed, seg.length_m) if sim_cfg.fuel_consumption else 0.0
+    deg      = _tyre_degrade_corner(corner_speed, seg.radius_m, state.tyre, weather) if sim_cfg.tyre_degradation else 0.0
 
-    # Check tyre blowout
-    if state.tyre.is_blown():
+    # Tyre blowout check (only when degradation is active)
+    if sim_cfg.tyre_degradation and state.tyre.is_blown():
         state.limp_mode = True
         state.blowouts += 1
 
-    # Check fuel
-    if state.fuel_l - fuel <= 0:
+    # Fuel empty check (only when fuel consumption is active)
+    if sim_cfg.fuel_consumption and state.fuel_l - fuel <= 0:
         state.limp_mode = True
         fuel = state.fuel_l
 
-    _update_state(state, corner_speed, fuel, seg_time, deg)
+    _update_state(state, corner_speed, fuel, seg_time, deg, sim_cfg)
 
     return SegmentResult(
         segment_id=seg.id, segment_type="corner",
@@ -381,18 +415,22 @@ def _update_state(
     fuel_used: float,
     time_s: float,
     degradation: float,
+    sim_cfg: SimConfig,
 ) -> None:
-    state.speed_m_s         = exit_speed
-    state.fuel_l            = max(0.0, state.fuel_l - fuel_used)
-    state.elapsed_s        += time_s
-    state.total_fuel_used  += fuel_used
-    state.tyre.total_degradation += degradation
-    state.total_degradation += degradation
+    state.speed_m_s  = exit_speed
+    state.elapsed_s += time_s
 
-    # Check blowout after degradation update
-    if state.tyre.is_blown() and not state.limp_mode:
-        state.limp_mode = True
-        state.blowouts += 1
+    if sim_cfg.fuel_consumption:
+        state.fuel_l           = max(0.0, state.fuel_l - fuel_used)
+        state.total_fuel_used += fuel_used
+
+    if sim_cfg.tyre_degradation:
+        state.tyre.total_degradation += degradation
+        state.total_degradation      += degradation
+        # Check blowout after degradation update
+        if state.tyre.is_blown() and not state.limp_mode:
+            state.limp_mode = True
+            state.blowouts += 1
 
 
 # ---------------------------------------------------------------------------
@@ -440,19 +478,30 @@ def _simulate_pit(
 # Main simulator entry point
 # ---------------------------------------------------------------------------
 
-def simulate(cfg: LevelConfig, strategy: RaceStrategy) -> SimResult:
+def simulate(
+    cfg: LevelConfig,
+    strategy: RaceStrategy,
+    sim_cfg: Optional[SimConfig] = None,
+) -> SimResult:
     """
     Simulate the full race.
 
     Parameters
     ----------
-    cfg      : LevelConfig
-    strategy : RaceStrategy
+    cfg     : LevelConfig
+    strategy: RaceStrategy
+    sim_cfg : SimConfig, optional
+        Controls which mechanics are active.  Defaults to SimConfig.full()
+        (all mechanics on).  Pass SimConfig.simple() for levels where tyre
+        degradation and fuel consumption are not factors.
 
     Returns
     -------
     SimResult
     """
+    if sim_cfg is None:
+        sim_cfg = SimConfig.full()
+
     car = cfg.car
 
     # Initialise state
@@ -495,9 +544,9 @@ def simulate(cfg: LevelConfig, strategy: RaceStrategy) -> SimResult:
                         target_m_s=car.max_speed_m_s,
                         brake_start_m_before_next=0.0,
                     )
-                result = _simulate_straight(seg, action, state, car, weather)
+                result = _simulate_straight(seg, action, state, car, weather, sim_cfg)
             else:
-                result = _simulate_corner(seg, state, car, weather)
+                result = _simulate_corner(seg, state, car, weather, sim_cfg)
 
             seg_results.append(result)
             lap_time += result.time_s

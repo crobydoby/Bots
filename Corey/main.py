@@ -21,14 +21,14 @@ from pathlib import Path
 
 from level_loader import load_level
 from strategy    import build_naive_strategy, save_strategy
-from simulator   import simulate
+from simulator   import simulate, SimConfig
 
 
 # ---------------------------------------------------------------------------
 # Optimiser hook — replace this with your metaheuristic
 # ---------------------------------------------------------------------------
 
-def optimise(cfg, level_path: str):
+def optimise(cfg, level_path: str, sim_cfg: SimConfig):
     """
     Generate an optimised RaceStrategy for the given level config.
 
@@ -36,7 +36,7 @@ def optimise(cfg, level_path: str):
     Replace the body of this function with your metaheuristic solver.
     """
     print("[optimise] Using naive baseline strategy (placeholder)")
-    return build_naive_strategy(cfg)
+    return build_naive_strategy(cfg, tyre_degradation=sim_cfg.tyre_degradation)
 
 
 # ---------------------------------------------------------------------------
@@ -55,11 +55,16 @@ def main():
     print(f"  Car   : max {cfg.car.max_speed_m_s} m/s  |  accel {cfg.car.accel_m_se2} m/s²  |  brake {cfg.car.brake_m_se2} m/s²")
     print()
 
-    # 2. Optimise
-    strategy = optimise(cfg, level_path)
+    # 2. Choose simulation mode.
+    # SimConfig.simple() disables tyre degradation and fuel consumption (Level 1).
+    # Switch to SimConfig.full() for levels 2–4 where those mechanics are active.
+    sim_cfg = SimConfig.simple()
 
-    # 3. Simulate and score
-    result = simulate(cfg, strategy)
+    # 3. Optimise
+    strategy = optimise(cfg, level_path, sim_cfg)
+
+    # 4. Simulate and score
+    result = simulate(cfg, strategy, sim_cfg)
     print(f"--- Simulation Result ---")
     print(f"  Total time  : {result.total_time_s:.2f} s  (ref: {cfg.race.time_reference_s:.2f} s)")
     print(f"  Fuel used   : {result.total_fuel_used_l:.4f} L  (soft cap: {cfg.race.fuel_soft_cap_limit_l} L)")
